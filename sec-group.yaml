@@ -1,0 +1,156 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Accept list of IPs for security group
+Parameters:
+  IPWhitelist:
+    Description: 'Allows network access from the following IPs (comma separated for multiple values). Make sure you append /32, example: 42.12.34.56/32, 10.10.10.10/32'
+    Type: String
+
+
+Resources:
+  VPC:
+    Type: 'AWS::EC2::VPC'
+    Properties:
+      CidrBlock: 10.10.0.0/16
+      Tags:
+        - Key: Name
+          Value: !Ref 'AWS::StackName'
+
+
+  LambdaToAcmRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: "Allows the lambda custom resource to create a custom security group"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: LambdaExecutionRole
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: '*'
+        - PolicyName: LambdaCreateSg
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ec2:CreateSecurityGroup'
+                  - 'ec2:AuthorizeSecurityGroupIngress'
+                  - 'ec2:DeleteSecurityGroup'
+                Resource: '*'
+
+
+  MainFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaToAcmRole.Arn
+      Code:
+        #Implement own cfn-response, as the aws version uses botocore requests, which will be deprecated.
+        ZipFile: |
+          import json
+          import os
+          import boto3
+          import urllib3
+          import time
+
+
+          def send_response(event, context, response_status, response_data, reason, physical_resource_id=None, no_echo=False):
+              http = urllib3.PoolManager()
+              response_body = {
+                  'Status': response_status,
+                  'Reason': reason,
+                  'PhysicalResourceId': physical_resource_id,
+                  'StackId': event['StackId'],
+                  'RequestId': event['RequestId'],
+                  'LogicalResourceId': event['LogicalResourceId'],
+                  'NoEcho': no_echo, 'Data': response_data
+              }
+              json_response_body = json.dumps(response_body)
+              r = http.request('PUT', event['ResponseURL'], body=json_response_body)
+
+
+          def on_create(event, context):
+              try:
+                  sec_group_ips = os.environ['WhiteList']
+                  ports_allowed = list(event['ResourceProperties']['Ports'].split(','))
+                  ports_allowed = [int(port.strip()) for port in ports_allowed]
+                  sec_group_list = list(sec_group_ips.split(","))
+                  sec_group_list = [ip.strip() for ip in sec_group_list]
+                  vpc_id = os.environ['VpcId']
+
+                  client = boto3.client('ec2')
+                  response = client.create_security_group(
+                      GroupName='MySecGroup',
+                      Description='MyDescription',
+                      VpcId=vpc_id
+                  )
+                  security_group_id = response['GroupId']
+
+                  ingress_list = []
+                  for port in ports_allowed:
+                      for ip in sec_group_list:
+                          ingress_list.append({
+                              'IpProtocol': 'tcp',
+                              'FromPort': port,
+                              'ToPort': port,
+                              'IpRanges': [{'CidrIp': ip}]
+
+                          })
+                  client.authorize_security_group_ingress(
+                      GroupId=security_group_id,
+                      IpPermissions=ingress_list
+                  )
+
+                  data = {"SecGroupId": security_group_id}
+                  send_response(event, context, 'SUCCESS', data, 'SecGroup Created', security_group_id, False)
+              except Exception as e:
+                  send_response(event, context, 'FAILED', {}, str(e), 'None', False)
+
+
+          def on_delete(event, context):
+              try:
+                  client = boto3.client('ec2')
+                  response = client.delete_security_group(
+                      GroupId=event['PhysicalResourceId']
+                  )
+                  send_response(event, context, 'SUCCESS', {}, 'SecGroup deleted', 'None', False)
+              except Exception as e:
+                  send_response(event, context, 'FAILED', {}, str(e), 'None', False)
+
+
+          def lambda_handler(event, context):
+              if event['RequestType'] == 'Delete':
+                  on_delete(event, context)
+              if event['RequestType'] == 'Create':
+                  on_create(event, context)
+      Runtime: python3.7
+      Environment:
+        Variables:
+          WhiteList: !Ref IPWhitelist
+          VpcId: !Ref VPC
+      Timeout: 30
+      Tags:
+        - Key: Name
+          Value: !Ref 'AWS::StackName'
+
+  CustomSG:
+    Type: "Custom::CustomSG"
+    Properties:
+      ServiceToken: !GetAtt MainFunction.Arn
+      Ports: 22,80
+      GroupName: MyCustomSecGroup
+      GroupDescription: MyCustomSecDescription
+
